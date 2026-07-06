@@ -48,7 +48,7 @@ class AuthService:
         refresh_token = create_refresh_token({"sub": str(user.id)})
 
         token_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
-        expires_at = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)).replace(tzinfo=None)
         db.add(RefreshToken(user_id=user.id, token_hash=token_hash, expires_at=expires_at))
         await db.commit()
 
@@ -77,7 +77,7 @@ class AuthService:
         new_access = create_access_token({"sub": user_id})
         new_refresh = create_refresh_token({"sub": user_id})
         new_hash = hashlib.sha256(new_refresh.encode()).hexdigest()
-        expires_at = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)).replace(tzinfo=None)
         db.add(RefreshToken(user_id=int(user_id), token_hash=new_hash, expires_at=expires_at))
         await db.commit()
         return TokenResponse(access_token=new_access, refresh_token=new_refresh)
