@@ -134,6 +134,95 @@ async def seed_settings(db: AsyncSession):
     print("  ✓ CMS settings seeded")
 
 
+# ── Synthetic people (for realistic variety across 3,600+ imported courses) ──
+FIRST_NAMES = [
+    "Sarah", "Marcus", "Elena", "David", "Priya", "James", "Olivia", "Daniel", "Sofia", "Michael",
+    "Aisha", "Ryan", "Natalie", "Ahmed", "Grace", "Kevin", "Yuki", "Carlos", "Emma", "Noah",
+    "Layla", "Thomas", "Hana", "Lucas", "Ingrid", "Omar", "Chloe", "Nathan", "Mei", "Victor",
+    "Zara", "Adrian", "Fatima", "Jack", "Isabella", "Diego", "Amara", "Felix", "Priyanka", "Owen",
+    "Nadia", "Simon", "Camila", "Leo", "Anya",
+]
+LAST_NAMES = [
+    "Chen", "Johnson", "Rodriguez", "Kim", "Patel", "Walker", "Martinez", "Bennett", "Costa", "Novak",
+    "Khan", "Foster", "Larsson", "Hassan", "Coleman", "Park", "Tanaka", "Silva", "Fischer", "Bishop",
+    "Ahmadi", "Reed", "Suzuki", "Moreau", "Andersen", "Farouk", "Bailey", "Pierce", "Wong", "Popescu",
+    "Ibrahim", "Kowalski", "Haddad", "Turner", "Romano", "Alvarez", "Nwosu", "Graham", "Sharma", "Bell",
+    "Saleh", "Novak", "Torres", "Marsh", "Petrova",
+]
+BIO_TEMPLATES = [
+    "Professional {role} with over {yrs} years of hands-on industry experience.",
+    "{role} and educator who has taught this subject to thousands of students online.",
+    "Working {role} who builds real-world projects and teaches what actually gets used on the job.",
+    "Passionate about {subject}, with a background as a {role} at both startups and larger companies.",
+    "Independent {role} and consultant, teaching practical, project-based courses since {year}.",
+]
+
+def _generate_people(existing_emails: set, count: int, seed: int) -> list[dict]:
+    """Deterministically generate `count` unique (first, last, email) combos."""
+    rng = random.Random(seed)
+    people = []
+    tries = 0
+    while len(people) < count and tries < count * 20:
+        tries += 1
+        fn, ln = rng.choice(FIRST_NAMES), rng.choice(LAST_NAMES)
+        email = f"{fn.lower()}.{ln.lower()}{rng.randint(1,999)}@learnhub.com"
+        if email in existing_emails:
+            continue
+        existing_emails.add(email)
+        people.append({"first_name": fn, "last_name": ln})
+    return people
+
+
+async def seed_synthetic_people(db: AsyncSession, roles: dict, existing_users: dict):
+    """Creates a realistic pool of instructor + student accounts so imported
+    Kaggle courses and reviews don't all funnel through one generic account."""
+    print("→ Seeding synthetic instructors & reviewers...")
+    existing_emails = {e for e in existing_users.keys()}
+
+    rng = random.Random(7)
+    instructor_people = _generate_people(existing_emails, 45, seed=101)
+    student_people = _generate_people(existing_emails, 90, seed=202)
+
+    instructors, students = [], []
+    for p in instructor_people:
+        email = f"instr.{p['first_name'].lower()}{p['last_name'].lower()}@learnhub.com"
+        res = await db.execute(select(User).where(User.email == email))
+        u = res.scalar_one_or_none()
+        if not u:
+            role_word = rng.choice(["developer", "designer", "analyst", "engineer", "consultant", "product manager", "marketer"])
+            bio = rng.choice(BIO_TEMPLATES).format(
+                role=role_word, yrs=rng.randint(4, 18), subject="their field", year=rng.randint(2014, 2021)
+            )
+            u = User(
+                email=email, first_name=p["first_name"], last_name=p["last_name"],
+                password_hash=get_password_hash(f"{p['first_name']}1234!"),
+                is_active=True, bio=bio,
+            )
+            db.add(u)
+            await db.flush()
+            db.add(UserRole(user_id=u.id, role_id=roles["Instructor"].id))
+        instructors.append(u)
+
+    for p in student_people:
+        email = f"student.{p['first_name'].lower()}{p['last_name'].lower()}@learnhub.com"
+        res = await db.execute(select(User).where(User.email == email))
+        u = res.scalar_one_or_none()
+        if not u:
+            u = User(
+                email=email, first_name=p["first_name"], last_name=p["last_name"],
+                password_hash=get_password_hash(f"{p['first_name']}1234!"),
+                is_active=True,
+            )
+            db.add(u)
+            await db.flush()
+            db.add(UserRole(user_id=u.id, role_id=roles["User"].id))
+        students.append(u)
+
+    await db.commit()
+    print(f"  ✓ {len(instructors)} instructors + {len(students)} student reviewers seeded")
+    return instructors, students
+
+
 # ── Categories & Courses ─────────────────────────────────────
 CATEGORIES = [
     ("Web Development", "web-development", "💻", "Build websites & web apps"),
@@ -291,39 +380,87 @@ This course is designed for {level.replace('_', ' ')} learners who want to make 
 
 
 # ── Reviews ──────────────────────────────────────────────────
-REVIEW_SAMPLES = [
-    (5, "Exactly what I needed to level up. Clear explanations and great pacing."),
-    (5, "The projects alone are worth the price. Landed a job two months after finishing."),
-    (4, "Really solid content. A few sections could be updated, but overall excellent."),
-    (5, "Best instructor I've had online. Complex topics finally make sense."),
-    (4, "Great course! The exercises are challenging in the best way."),
-    (5, "I went from zero knowledge to building my own projects. Highly recommend."),
+# Rating-tiered comment banks so sentiment always matches the star rating,
+# the way real Udemy reviews read.
+REVIEWS_5 = [
+    "Exactly what I needed to level up. Clear explanations and a great pace throughout.",
+    "The projects alone are worth the price. I landed a job two months after finishing.",
+    "Best instructor I've had online — complex topics finally made sense.",
+    "I went from zero knowledge to building my own projects. Highly recommend this one.",
+    "Genuinely one of the best courses I've taken on this topic. Really well structured.",
+    "Loved every section. The instructor explains things at just the right depth.",
+    "This exceeded my expectations. Practical, up to date, and well paced.",
+    "Fantastic value for the price — I still reference these notes at work.",
+    "Clear, concise, and packed with real examples. Would take another course from them.",
+    "Perfect for going from beginner to confident in just a few weeks.",
+    "The hands-on projects made all the difference. I actually retained everything.",
+    "Great mix of theory and practice. No fluff, just useful content.",
 ]
+REVIEWS_4 = [
+    "Really solid content. A few sections could be updated, but overall excellent.",
+    "Great course! The exercises are challenging in the best way.",
+    "Very informative, though the pacing slows down a bit in the middle.",
+    "Good overview of the topic. Would've liked a few more real-world examples.",
+    "Solid course overall, though the audio quality could be a little better.",
+    "Learned a lot, though a couple of lectures felt a bit rushed near the end.",
+    "Well organized and easy to follow. Docked one star only for a few outdated slides.",
+    "Good value for the price. Some sections are stronger than others.",
+]
+REVIEWS_3 = [
+    "Decent introduction but assumes some background knowledge not mentioned in the description.",
+    "Covers the basics well but doesn't go very deep into advanced topics.",
+    "It's fine as a refresher, but I expected more hands-on projects.",
+    "Some parts feel outdated. Still useful overall, but could use a refresh.",
+    "Okay course. Gets the fundamentals across but the pacing is uneven.",
+]
+REVIEWS_2 = [
+    "The course felt rushed and skipped over some important details.",
+    "Audio and video quality were inconsistent throughout.",
+    "Not as in-depth as the description suggested.",
+]
+REVIEWS_1 = [
+    "Didn't match the course description at all, unfortunately.",
+    "Too basic for something labeled 'advanced'.",
+]
+# Weighted like real course-review distributions: mostly positive, a long tail of criticism.
+RATING_POOLS = [(5, REVIEWS_5), (4, REVIEWS_4), (3, REVIEWS_3), (2, REVIEWS_2), (1, REVIEWS_1)]
+RATING_WEIGHTS = [50, 30, 12, 5, 3]
 
-async def seed_reviews(db: AsyncSession, users: dict):
-    print("→ Seeding sample reviews...")
-    result = await db.execute(select(Course).order_by(Course.num_subscribers.desc()).limit(12))
+
+async def seed_reviews(db: AsyncSession, students: list[User]):
+    print("→ Seeding realistic reviews...")
+    if not students:
+        print("  ✗ No student reviewers available, skipping.")
+        return
+    rng = random.Random(99)
+    # Spread reviews across many more courses than before, weighted toward popular ones.
+    result = await db.execute(select(Course).order_by(Course.num_subscribers.desc()).limit(300))
     courses = result.scalars().all()
-    reviewers = [u for e, u in users.items() if e != "system@learnhub.com"]
+
     count = 0
-    for ci, course in enumerate(courses):
+    for course in courses:
         existing = await db.execute(select(Review).where(Review.course_id == course.id).limit(1))
         if existing.scalar_one_or_none():
             continue
-        for ri in range(3):
-            rating, comment = REVIEW_SAMPLES[(ci + ri) % len(REVIEW_SAMPLES)]
-            reviewer = reviewers[(ci + ri) % len(reviewers)]
+        # Popular courses get more reviews, smaller ones get fewer — mirrors real platforms.
+        n_reviews = rng.randint(2, 4) if course.num_subscribers < 20000 else rng.randint(4, 8)
+        chosen_students = rng.sample(students, k=min(n_reviews, len(students)))
+        for reviewer in chosen_students:
+            rating, pool = rng.choices(RATING_POOLS, weights=RATING_WEIGHTS, k=1)[0]
+            comment = rng.choice(pool)
             db.add(Review(
                 course_id=course.id, student_id=reviewer.id,
                 rating=rating, comment=comment, is_approved=True,
             ))
             count += 1
+        if count % 500 < 8:
+            await db.flush()
     await db.commit()
-    print(f"  ✓ {count} reviews seeded")
+    print(f"  ✓ {count} reviews seeded across {len(courses)} courses")
 
 
 # ── Kaggle Import (Optional) ─────────────────────────────────
-async def seed_from_kaggle(db: AsyncSession, system_user: User):
+async def seed_from_kaggle(db: AsyncSession, system_user: User, instructors: list[User]):
     if not os.path.exists(CSV_PATH):
         print(f"\n💡 Tip: download the Kaggle CSV for 5,000+ real courses")
         print(f"   https://www.kaggle.com/datasets/yusufdelikkaya/udemy-online-education-courses")
@@ -375,6 +512,12 @@ async def seed_from_kaggle(db: AsyncSession, system_user: User):
     total = min(len(df), 5000)
     print(f"  → Importing up to {total} courses...")
 
+    # Weighted so a handful of instructors are "prolific" (like real platforms)
+    # while most teach only a few courses — avoids everything funneling to one account.
+    rng = random.Random(2024)
+    pool = instructors if instructors else [system_user]
+    weights = [3 if i < max(1, len(pool) // 6) else 1 for i in range(len(pool))]
+
     for idx, row in df.head(total).iterrows():
         try:
             title = str(row[title_col]).strip() if title_col else ""
@@ -417,6 +560,8 @@ async def seed_from_kaggle(db: AsyncSession, system_user: User):
             description = str(row[desc_col]).strip()[:2000] if desc_col and str(row[desc_col]) != "nan" else title
             language = str(row[lang_col])[:5] if lang_col and str(row[lang_col]) != "nan" else "en"
 
+            instructor = rng.choices(pool, weights=weights, k=1)[0]
+
             course = Course(
                 title=title[:255], slug=slug,
                 description=description, short_description=description[:200],
@@ -426,7 +571,7 @@ async def seed_from_kaggle(db: AsyncSession, system_user: User):
                 avg_rating=min(5.0, max(0.0, avg_rating)),
                 num_reviews=max(0, num_reviews),
                 language=language, category_id=category_id,
-                instructor_id=system_user.id, created_by=system_user.id,
+                instructor_id=instructor.id, created_by=instructor.id,
             )
             db.add(course)
             imported += 1
@@ -456,8 +601,9 @@ async def main():
         users = await seed_users(db, roles)
         await seed_settings(db)
         await seed_categories_and_courses(db, users)
-        await seed_reviews(db, users)
-        await seed_from_kaggle(db, users["system@learnhub.com"])
+        synthetic_instructors, synthetic_students = await seed_synthetic_people(db, roles, users)
+        await seed_from_kaggle(db, users["system@learnhub.com"], synthetic_instructors)
+        await seed_reviews(db, synthetic_students)
 
     print("\n" + "=" * 50)
     print("✅ Seeding complete!\n")
